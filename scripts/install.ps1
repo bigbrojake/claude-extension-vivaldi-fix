@@ -104,6 +104,142 @@ $json = $manifest | ConvertTo-Json -Depth 20
 [System.IO.File]::WriteAllText($manifestPath, $json, (New-Object System.Text.UTF8Encoding $false))
 Write-Ok "Added side_panel.default_path, removed update_url"
 
+# --- 4b. Inject tabId when the static path omits it ---------------------------
+# The service worker normally opens `sidepanel.html?tabId=N`; without tabId the panel
+# never connects to the service worker and claude.ai shows "Can't reach the Claude
+# extension". Gate the main module behind a loader that adds the active tab's id.
+# ponytail: binds to the tab active when the panel opens; reopen the panel to rebind.
+Write-Step "Patching sidepanel.html (tabId loader)"
+$htmlPath = Join-Path $Destination 'sidepanel.html'
+$html = [System.IO.File]::ReadAllText($htmlPath)
+$m = [regex]::Match($html, '<script type="module" crossorigin src="(/assets/sidepanel-[^"]+\.js)"></script>')
+if (-not $m.Success) { Write-Err2 "sidepanel module tag not found; extension layout changed."; exit 1 }
+$loader = @"
+(function () {
+  var q = new URLSearchParams(location.search);
+  function boot() {
+    var s = document.createElement('script');
+    s.type = 'module'; s.crossOrigin = ''; s.src = '$($m.Groups[1].Value)';
+    document.head.appendChild(s);
+  }
+  // Active tab of a normal window, never the panel's own tab (Vivaldi hosts it in a tab).
+  function activeTab(cb) {
+    chrome.tabs.getCurrent(function (self) {
+      chrome.tabs.query({ active: true, lastFocusedWindow: true, windowType: 'normal' }, function (tabs) {
+        cb(tabs.filter(function (t) {
+          var u = t.url || t.pendingUrl || '';
+          return (!self || t.id !== self.id) && u && !u.startsWith(location.origin);
+        })[0]);
+      });
+    });
+  }
+  if (q.get('mode') === 'window') return boot();
+  // Vivaldi 8.3 resets the panel to its default path on any URL change (navigation or
+  // history.replaceState), which looped forever. So never touch the URL: hand the
+  // params to the patched module through window.__vivaldiSearch.
+  activeTab(function (active) {
+    if (active) { q.set('tabId', active.id); window.__vivaldiSearch = '?' + q; }
+    boot();
+    chrome.tabs.onRemoved.addListener(function (id) {
+      if (String(id) === q.get('tabId')) location.reload(); // reload rebinds to the active tab
+    });
+  });
+})();
+"@
+[System.IO.File]::WriteAllText((Join-Path $Destination 'vivaldi-tabid.js'), $loader, (New-Object System.Text.UTF8Encoding $false))
+$html = $html.Replace($m.Value, '<script src="/vivaldi-tabid.js"></script>')
+$modPath = Join-Path $Destination ($m.Groups[1].Value.TrimStart('/'))
+$mod = [System.IO.File]::ReadAllText($modPath)
+$hits = ([regex]::Matches($mod, [regex]::Escape('new URLSearchParams(window.location.search)'))).Count
+if ($hits -eq 0) { Write-Err2 "location.search reads not found in sidepanel module; extension layout changed."; exit 1 }
+$mod = $mod.Replace('new URLSearchParams(window.location.search)', 'new URLSearchParams(window.__vivaldiSearch??window.location.search)')
+[System.IO.File]::WriteAllText($modPath, $mod, (New-Object System.Text.UTF8Encoding $false))
+Write-Ok "Redirected $hits location.search reads in the panel module"
+[System.IO.File]::WriteAllText($htmlPath, $html, (New-Object System.Text.UTF8Encoding $false))
+Write-Ok "Added vivaldi-tabid.js loader"
+
+# --- 4c. Accept the side panel as an extension page ---------------------------
+# The service worker only trusts senders with no `tab` (true for Chrome's side panel),
+# but Vivaldi hosts the panel in a tab, so every panel request is rejected
+# ("sender is not an extension page"). Check the sender URL instead: still excludes
+# content scripts and web pages.
+Write-Step "Patching service worker sender check"
+$swPath = (Get-ChildItem (Join-Path $Destination 'assets') -Filter 'service-worker*.js' | Select-Object -First 1).FullName
+$sw = [System.IO.File]::ReadAllText($swPath)
+$re = 'return void 0===(\w)\.tab&&\1\.id===chrome\.runtime\.id\}'
+if ([regex]::IsMatch($sw, $re)) {
+    # Extension <= 1.0.106: the check is inline in the service worker.
+    $sw = [regex]::Replace($sw, $re, 'return $1.id===chrome.runtime.id&&($1.url||"").startsWith(chrome.runtime.getURL(""))}')
+    Write-Ok "Inline sender check patched (<= 1.0.106 layout)"
+} else {
+    # Extension 1.0.107+: the check moved to a shared helper in another chunk and
+    # already verifies id + extension URL, so only the `tab === undefined` clause goes.
+    $helperRe = '(function \w+\((\w)\)\{return void 0!==\2&&)void 0===\2\.tab&&(\2\.id===chrome\.runtime\.id&&"string"==typeof \2\.url&&\2\.url\.startsWith\(`chrome-extension://\$\{chrome\.runtime\.id\}/`\))'
+    $helperHits = 0
+    foreach ($f in Get-ChildItem (Join-Path $Destination 'assets') -Filter '*.js') {
+        $c = [System.IO.File]::ReadAllText($f.FullName)
+        if ([regex]::IsMatch($c, $helperRe)) {
+            $c = [regex]::Replace($c, $helperRe, '$1$3')
+            [System.IO.File]::WriteAllText($f.FullName, $c, (New-Object System.Text.UTF8Encoding $false))
+            if ($f.FullName -eq $swPath) { $sw = $c }
+            $helperHits++
+        }
+    }
+    if ($helperHits -eq 0) { Write-Err2 "sender check not found; extension layout changed."; exit 1 }
+    Write-Ok "Shared sender check patched in $helperHits file(s) (1.0.107+ layout)"
+    # 1.0.107+ also requires the panel's tabId in the sender URL, which the loader
+    # deliberately leaves untouched. Fall back to the panelTabId the panel sends.
+    $tabRe = 'const (\w)=(\w+)\((\w)\.url\),(\w)=(\w)\.panelTabId;if\(void 0===\1\|\|'
+    if ([regex]::IsMatch($sw, $tabRe)) {
+        $sw = [regex]::Replace($sw, $tabRe, 'const $4=$5.panelTabId,$1=$2($3.url)??(Number.isInteger($4)?$4:void 0);if(void 0===$1||')
+        Write-Ok "panelTabId check falls back to the panel's own tabId"
+    } else { Write-Warn2 "panelTabId check not found; panel may report a tab mismatch." }
+}
+# Same for claude.ai framed in the panel (onMessageExternal): its sender.tab is the
+# panel's own tab, so trust it when that tab is sidepanel.html.
+$inPanel = '(void 0===$1.tab||($1.tab.url||"").startsWith(chrome.runtime.getURL("sidepanel.html")))'
+$n = 0
+foreach ($p in @(
+    @{ re = '(?<="get_sidepanel_host_info"===\w\.type\)try\{const \w=)void 0===(\w)\.tab'; to = $inPanel },
+    # The array name changes between builds (ho, vc, ...), so match any identifier.
+    @{ re = '(?<=\w+\.includes\(\w\.type\)\)\{if\()void 0!==(\w)\.tab(?=\|\|!\w+\(\1\.origin\))'; to = "!$inPanel" }
+)) {
+    if ([regex]::IsMatch($sw, $p.re)) { $sw = [regex]::Replace($sw, $p.re, $p.to); $n++ }
+}
+if ($n -lt 2) { Write-Warn2 "Only $n/2 external sender checks patched; extension layout changed." }
+# Surface the real cause instead of a generic message when the anchor group fails.
+$sw = $sw.Replace('catch(t){return{ok:!1,error:"anchor tab-group initialization failed"}}', 'catch(t){return{ok:!1,error:"anchor tab-group initialization failed: "+(t&&t.message||t)}}')
+
+[System.IO.File]::WriteAllText($swPath, $sw, (New-Object System.Text.UTF8Encoding $false))
+Write-Ok "Sender checks now URL-based"
+
+# --- 4c2. Don't refuse the panel because it lives in a tab --------------------
+# 1.0.107+: the panel calls chrome.tabs.getCurrent(); in Chrome that is undefined for a
+# side panel. In Vivaldi it returns the hosting tab, and getContexts() does not report
+# SIDE_PANEL, so the panel renders "Claude isn't available on this page". Keep the
+# framed and handover-window checks, but accept the remaining case as the side panel.
+Write-Step "Patching side panel window check"
+$panelPath = Join-Path $Destination ($m.Groups[1].Value.TrimStart('/'))
+$panel = [System.IO.File]::ReadAllText($panelPath)
+$refuseRe = 'e=\w\?"no_handover":"unlisted_not_side_panel"\}\}\}catch\((\w+)\)\{e="check_failed"\}return\{kind:"refused",reason:e\}\}'
+if ([regex]::IsMatch($panel, $refuseRe)) {
+    $panel = [regex]::Replace($panel, $refuseRe, 'return{kind:"sidePanel"}}}}catch($1){e="check_failed"}return{kind:"refused",reason:e}}')
+    [System.IO.File]::WriteAllText($panelPath, $panel, (New-Object System.Text.UTF8Encoding $false))
+    Write-Ok "Panel accepts being hosted in a Vivaldi tab"
+} else { Write-Warn2 "Window check not found (older build or layout changed); skipping." }
+
+# --- 4d. Emulate tab groups ---------------------------------------------------
+# Vivaldi 8.3: chrome.tabs.group() returns an id but groups nothing, so every
+# browser tool fails with "anchor tab group not established". Load a shim that
+# emulates chrome.tabGroups before the service worker and the panel module.
+Write-Step "Adding tab group emulation"
+Copy-Item (Join-Path $PSScriptRoot 'vivaldi-groups-shim.js') $Destination
+$loaderPath = Join-Path $Destination 'service-worker-loader.js'
+[System.IO.File]::WriteAllText($loaderPath, "import './vivaldi-groups-shim.js';`n" + [System.IO.File]::ReadAllText($loaderPath), (New-Object System.Text.UTF8Encoding $false))
+$html = [System.IO.File]::ReadAllText($htmlPath).Replace('<script src="/vivaldi-tabid.js"></script>', '<script src="/vivaldi-groups-shim.js"></script><script src="/vivaldi-tabid.js"></script>')
+[System.IO.File]::WriteAllText($htmlPath, $html, (New-Object System.Text.UTF8Encoding $false))
+Write-Ok "Shim loaded in service worker and side panel"
+
 # --- 5. Verify native messaging host registration ----------------------------
 Write-Step "Checking native-messaging host registration for Vivaldi"
 $nmKey = 'HKCU:\Software\Vivaldi\NativeMessagingHosts\com.anthropic.claude_browser_extension'
